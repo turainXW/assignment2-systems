@@ -1,0 +1,30 @@
+{
+  "config": {
+    "vocab_size": 5000,
+    "context_length": 128,
+    "d_model": 256,
+    "num_layers": 2,
+    "num_heads": 4,
+    "d_ff": 512,
+    "batch_size": 4,
+    "device": "cpu"
+  },
+  "model_info": {
+    "num_parameters": 3872000
+  },
+  "memory": {
+    "param_memory_mb": 14.7705078125
+  },
+  "forward": {
+    "mean_time": 0.005649283400271088,
+    "min_time": 0.005191083997488022,
+    "max_time": 0.007010333007201552,
+    "std_time": 0.0006846991316007483
+  },
+  "forward_backward": {
+    "mean_time": 0.0297702997981105,
+    "min_time": 0.0263261660002172,
+    "max_time": 0.03386308399785776,
+    "std_time": 0.002591061115439687
+  }
+}
