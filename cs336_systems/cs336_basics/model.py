@@ -377,12 +377,19 @@ class TransformerBlock(nn.Module):
         # NOTE: this is a pre-norm Transformer, and differs from the original
         # description in the paper.
         # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x))
-        attn_sublayer_output = x + x_attn
+        with torch.cuda.nvtx.range("RMSNorm_1"):
+            norm_x = self.ln1(x)
+        with torch.cuda.nvtx.range("Attention"):
+            x_attn = self.attn(norm_x)
+        with torch.cuda.nvtx.range("Residual_Add_1"):
+            attn_sublayer_output = x + x_attn
 
         # Apply the feed-forward sublayer
-        x_ffn = self.ffn(self.ln2(attn_sublayer_output))
-        ffn_sublayer_output = attn_sublayer_output + x_ffn
+        with torch.cuda.nvtx.range("FeedForward"):
+            norm_attn_output = self.ln2(attn_sublayer_output)
+            x_ffn = self.ffn(norm_attn_output)
+        with torch.cuda.nvtx.range("Residual_Add_2"):
+            ffn_sublayer_output = attn_sublayer_output + x_ffn
         return ffn_sublayer_output
 
 
