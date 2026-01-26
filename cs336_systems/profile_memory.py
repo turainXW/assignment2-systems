@@ -1,20 +1,26 @@
 import torch
 import time
 import argparse
-import contextlib
 import os
+import gc
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
-from torch.autograd.profiler import emit_nvtx
 
+# --- 全局性能优化配置 ---
+torch.set_float32_matmul_precision('high')  # 开启 TF32 加速矩阵乘法
+import torch._functorch.config
+torch._functorch.config.donated_buffer = False  # 兼容某些编译路径下的 backward
 
-def run_memory_profile(args, context_length):
+# 确保快照目录存在
+OUTPUT_DIR = "transformer_profile"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def run_benchmark(args, context_length, use_compile=False):
     device = args.device
-    mixed_precision = args.mixed_precision
-    
-    print(f"\n>>> Profiling Model | Context: {context_length} | MP: {mixed_precision} | Device: {device}")
-    
-    # 1. 动态初始化模型
+    mode_str = "Compiled" if use_compile else "Vanilla"
+    print(f"\n>>> Running {mode_str} | Context: {context_length} | Device: {device}")
+
+    # 1. 初始化模型
     model = BasicsTransformerLM(
         vocab_size=args.vocab_size,
         context_length=context_length,
@@ -22,136 +28,128 @@ def run_memory_profile(args, context_length):
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         d_ff=args.d_ff,
-        rope_theta=args.rope_theta,
+        rope_theta=10000
     ).to(device)
-    
-    # 打印参数量确认
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {num_params:,}")
 
     optimizer = AdamW(model.parameters(), lr=1e-4)
     input_ids = torch.randint(0, args.vocab_size, (args.batch_size, context_length), device=device)
-    autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if mixed_precision else contextlib.nullcontext()
-
-    # --- 阶段 0: 预热 (Warmup) ---
-    # 预热一轮，让 CUDA 初始化算法，确保后续性能测试准确
-    print("Warming up...")
-    optimizer.zero_grad()
-    with autocast_ctx:
-        loss = model(input_ids).mean()
-    loss.backward()
-    optimizer.step()
-    torch.cuda.synchronize()
-
-    # --- 阶段 1: Nsight Systems 性能分析 (nsys) ---
-    print("Capturing NVTX ranges for nsys...")
-    torch.cuda.cudart().cudaProfilerStart() 
     
-    with emit_nvtx(record_shapes=True): 
-        # 1.1 前向传播
-        torch.cuda.nvtx.range_push("Forward_Pass")
-        with autocast_ctx:
-            logits = model(input_ids)
-            loss = logits.mean()
-        torch.cuda.synchronize() 
-        torch.cuda.nvtx.range_pop()
-        
-        # 1.2 反向传播
-        torch.cuda.nvtx.range_push("Backward_Pass")
-        loss.backward()
-        torch.cuda.synchronize()
-        torch.cuda.nvtx.range_pop()
+    # 2. 应用 torch.compile
+    if use_compile:
+        print("Compiling model... (this may take several minutes)")
+        model = torch.compile(model)
 
-        # 1.3 优化器更新
-        torch.cuda.nvtx.range_push("Optimizer_Step")
-        optimizer.step()
-        torch.cuda.synchronize()
-        torch.cuda.nvtx.range_pop()
-
-    torch.cuda.cudart().cudaProfilerStop()
-    print("NVTX capture finished.")
-
-
-    # --- 阶段 2: 仅前向传播显存快照 (Memory Snapshot) ---
-    model.eval()
-    torch.cuda.reset_peak_memory_stats()
-    
-    # 开启记录显存历史
-    torch.cuda.memory._record_memory_history(max_entries=1000000)
-    
-    with torch.no_grad():
-        with autocast_ctx:
-            _ = model(input_ids)
-    
-    fname_fwd = f"mem_fwd_ctx{context_length}_d{args.d_model}_l{args.num_layers}_mp{mixed_precision}.pickle"
-    torch.cuda.memory._dump_snapshot(fname_fwd)
-    peak_fwd = torch.cuda.max_memory_allocated() / (1024**2)
-    
-    torch.cuda.memory._record_memory_history(enabled=None)
-    print(f"Forward Peak: {peak_fwd:.2f} MB saved to {fname_fwd}")
-
-
-    # --- 阶段 3: 完整训练步显存快照 (Forward + Backward + Optimizer) ---
-    model.train()
-    torch.cuda.reset_peak_memory_stats()
-    
-    # 重新开启记录显存历史
-    torch.cuda.memory._record_memory_history(max_entries=1000000)
-    
     try:
+        # 3. 充分预热 (Warmup)
+        # 对于编译模式，至少需要 10-15 次迭代让 Triton Kernel 稳定
+        warmup_steps = 15 if use_compile else 5
+        print(f"Warming up ({warmup_steps} steps)...")
+        for _ in range(warmup_steps):
+            optimizer.zero_grad()
+            # 使用混合精度以节省显存
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(input_ids)
+                loss = logits.mean()
+            loss.backward()
+            optimizer.step()
+        torch.cuda.synchronize()
+
+        # 4. 测量前向传播耗时 (Forward Pass)
+        num_iters = 30
+        print(f"Measuring Forward Pass ({num_iters} iterations)...")
+        start_fwd = time.perf_counter()
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                for _ in range(num_iters):
+                    _ = model(input_ids)
+        torch.cuda.synchronize()
+        fwd_time_ms = (time.perf_counter() - start_fwd) / num_iters * 1000
+
+        # 5. 测量完整步耗时 (FW + BW + Opt)
+        print(f"Measuring Full Step ({num_iters} iterations)...")
+        start_full = time.perf_counter()
+        for _ in range(num_iters):
+            optimizer.zero_grad()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(input_ids)
+                loss = logits.mean()
+            loss.backward()
+            optimizer.step()
+        torch.cuda.synchronize()
+        full_time_ms = (time.perf_counter() - start_full) / num_iters * 1000
+
+        # 6. 显存记录与快照
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.memory._record_memory_history(max_entries=100000)
+        
+        # 跑一次完整的步来捕捉显存峰值
         optimizer.zero_grad()
-        with autocast_ctx:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = model(input_ids)
             loss = logits.mean()
         loss.backward()
         optimizer.step()
         
-        fname_full = f"mem_full_ctx{context_length}_d{args.d_model}_l{args.num_layers}_mp{mixed_precision}.pickle"
-        torch.cuda.memory._dump_snapshot(fname_full)
-        peak_full = torch.cuda.max_memory_allocated() / (1024**2)
-        print(f"Full Step Peak: {peak_full:.2f} MB saved to {fname_full}")
+        peak_mem_mb = torch.cuda.max_memory_allocated() / (1024**2)
+        
+        # 存入快照
+        snap_name = f"{mode_str}_ctx{context_length}_d{args.d_model}.pickle"
+        torch.cuda.memory._dump_snapshot(os.path.join(OUTPUT_DIR, snap_name))
+        torch.cuda.memory._record_memory_history(None)
+
+        return fwd_time_ms, full_time_ms, peak_mem_mb
+
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
-            print(f"!!! OOM for Context {context_length} during Full Training Step !!!")
-            peak_full = -1
+            print(f"!!! OOM Detected in {mode_str} Mode !!!")
+            return "OOM", "OOM", "OOM"
         else:
             raise e
     finally:
-        torch.cuda.memory._record_memory_history(enabled=None)
-
-    # 彻底清理内存，为下一个 context length 腾空间
-    del model
-    del optimizer
-    torch.cuda.empty_cache()
-    
-    return peak_fwd, peak_full
+        # 严格清理显存，防止模式间干扰
+        del model
+        del optimizer
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
 def main():
-    parser = argparse.ArgumentParser(description="Dynamic Memory Profiler for Transformer")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--vocab-size", type=int, default=50257)
-    parser.add_argument("--d-model", type=int, default=2560)
-    parser.add_argument("--num-layers", type=int, default=32)
-    parser.add_argument("--num-heads", type=int, default=32)
-    parser.add_argument("--d-ff", type=int, default=10240)
-    parser.add_argument("--rope-theta", type=float, default=10000.0)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--context-lengths", type=int, nargs="+", default=[128, 256, 512])
+    # 24GB 显存建议参数 (d_model=1024, layers=24 是一个比较稳妥的规模)
+    parser.add_argument("--d-model", type=int, default=1024)
+    parser.add_argument("--num-layers", type=int, default=12)
+    parser.add_argument("--num-heads", type=int, default=16)
+    parser.add_argument("--d-ff", type=int, default=4096)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--context-lengths", type=int, nargs="+", default=[512, 1024, 2048])
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--mixed-precision", action="store_true")
-
     args = parser.parse_args()
 
     results = []
-    for cl in args.context_lengths:
-        fwd, full = run_memory_profile(args, cl)
-        results.append((cl, fwd, full))
 
-    print("\n\n" + " SUMMARY TABLE ".center(50, "="))
-    print(f"{'Context':<10} | {'Fwd Peak (MB)':<15} | {'Full Peak (MB)':<15}")
-    print("-" * 50)
-    for cl, fwd, full in results:
-        full_str = f"{full:.2f}" if full > 0 else "OOM"
-        print(f"{cl:<10} | {fwd:<15.2f} | {full_str:<15}")
+    for cl in args.context_lengths:
+        # 1. 运行 Vanilla
+        fwd_v, full_v, mem_v = run_benchmark(args, cl, use_compile=False)
+        # 2. 运行 Compiled
+        fwd_c, full_c, mem_c = run_benchmark(args, cl, use_compile=True)
+        
+        results.append({
+            "ctx": cl,
+            "fwd_v": fwd_v, "fwd_c": fwd_c,
+            "full_v": full_v, "full_c": full_c,
+            "mem_v": mem_v, "mem_c": mem_c
+        })
+
+    # 打印最终对比表
+    print("\n" + "="*85)
+    print(f"{'Ctx Len':<8} | {'FW Vanilla':<12} | {'FW Compile':<12} | {'Full Vanilla':<12} | {'Full Compile':<12}")
+    print("-" * 85)
+    for r in results:
+        def fmt(val): return f"{val:.2f}" if isinstance(val, float) else val
+        print(f"{r['ctx']:<8} | {fmt(r['fwd_v']):<12} | {fmt(r['fwd_c']):<12} | {fmt(r['full_v']):<12} | {fmt(r['full_c']):<12}")
+    print("="*85)
+    print(f"Memory snapshots saved in ./{OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()
