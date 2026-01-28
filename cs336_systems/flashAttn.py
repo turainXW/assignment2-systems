@@ -1,4 +1,3 @@
-
 import torch
 from torch import nn
 import triton
@@ -15,102 +14,142 @@ def flash_backward(
     dO: torch.Tensor,
     L: torch.Tensor,
     is_causal: bool,
-    scale: float):
-    # Placeholder for backward implementation
+    scale):
+    
+    # 初始化梯度张量，类型与输入保持一致 (可能是 bf16)
     dQ = torch.zeros_like(Q)
     dK = torch.zeros_like(K)
     dV = torch.zeros_like(V)
 
-    Bq,Bk=16,16
+    Bq, Bk = 16, 16
     N, Length, D = Q.shape
     assert Length % Bq == 0 and Length % Bk == 0
     Tq = Length // Bq
     Tk = Length // Bk
-    Dvec=torch.sum(dO*O,dim=-1)
+    
+    # Delta term for dQ calculation
+    Dvec = torch.sum(dO * O, dim=-1) # (N, Length)
 
     for i in range(0, Tk):
-        k_tile=K[:,i*Bk:(i+1)*Bk,:]
-        v_tile=V[:,i*Bk:(i+1)*Bk,:]
+        k_tile = K[:, i*Bk:(i+1)*Bk, :]
+        v_tile = V[:, i*Bk:(i+1)*Bk, :]
+        
+        # 临时累积器，防止精度不够
+        dK_chunk = torch.zeros((N, Bk, D), device=Q.device, dtype=torch.float32)
+        dV_chunk = torch.zeros((N, Bk, D), device=Q.device, dtype=torch.float32)
+
         for j in range(0, Tq):
-            q_tile=Q[:,j*Bq:(j+1)*Bq,:]
-            o_tile=O[:,j*Bq:(j+1)*Bq,:]
-            do_tile=dO[:,j*Bq:(j+1)*Bq,:]
-            dq_tile=torch.zeros((N,Bq,D), device=Q.device, dtype=Q.dtype)
-            dk_tile=torch.zeros((N,Bk,D), device=Q.device, dtype=K.dtype)
-            dv_tile=torch.zeros((N,Bk,D), device=Q.device, dtype=V.dtype)
-            l_tile=L[:,j*Bq:(j+1)*Bq]
-            D_tile=Dvec[:,j*Bq:(j+1)*Bq]
-            # The actual backward computation should be implemented here
-            # This is a placeholder to illustrate the structure
+            q_tile = Q[:, j*Bq:(j+1)*Bq, :]
+            o_tile = O[:, j*Bq:(j+1)*Bq, :]
+            do_tile = dO[:, j*Bq:(j+1)*Bq, :]
+            
+            dq_tile = torch.zeros((N, Bq, D), device=Q.device, dtype=torch.float32)
+            
+            l_tile = L[:, j*Bq:(j+1)*Bq]
+            D_tile = Dvec[:, j*Bq:(j+1)*Bq]
 
-            s_tile=torch.einsum('...bd,...kd->...bk',q_tile,k_tile)/(D**0.5)
+            # Recompute Attention Score S
+            # cast to float for precision in backward math
+            q_tile_f = q_tile.float()
+            k_tile_f = k_tile.float()
+            v_tile_f = v_tile.float()
+            
+            s_tile = torch.einsum('...bd,...kd->...bk', q_tile_f, k_tile_f) * scale
+            
             if is_causal:
-                q_pos=torch.arange(j*Bq,(j+1)*Bq,device=Q.device)
-                k_pos=torch.arange(i*Bk,(i+1)*Bk,device=Q.device)
-                mask=(k_pos[None,:]<=q_pos[:,None])
-                s_tile=s_tile.masked_fill(~mask[None,:,:],float('-inf'))
+                q_pos = torch.arange(j*Bq, (j+1)*Bq, device=Q.device)
+                k_pos = torch.arange(i*Bk, (i+1)*Bk, device=Q.device)
+                mask = (k_pos[None, :] <= q_pos[:, None])
+                s_tile = s_tile.masked_fill(~mask[None, :, :], float('-inf'))
 
-            p_tile=torch.exp(s_tile-l_tile.unsqueeze(-1))
-            dv_tile+=torch.einsum('...qk,...qd->...kd',p_tile,do_tile)
-            dp_tile=torch.einsum('...qd,...kd->...qk',do_tile,v_tile)
-            ds_tile=p_tile*(dp_tile-D_tile.unsqueeze(-1))/(D**0.5)
-            dq_tile+=torch.einsum('...qk,...kd->...qd',ds_tile,k_tile)
-            dk_tile+=torch.einsum('...qk,...qd->...kd',ds_tile,q_tile)
-            dK[:,i*Bk:(i+1)*Bk,:]+=dk_tile
-            dV[:,i*Bk:(i+1)*Bk,:]+=dv_tile
-            dQ[:,j*Bq:(j+1)*Bq,:]+=dq_tile
-    return dQ,dK,dV
+            # P = exp(S - L)
+            p_tile = torch.exp(s_tile - l_tile.unsqueeze(-1)) # (N, Bq, Bk)
+            
+            # dV = P^T * dO
+            # dV accum: (N, Bk, D)
+            do_tile_f = do_tile.float()
+            p_tile_f = p_tile.float() # ensure P is float
+            
+            dv_tile = torch.einsum('...qk,...qd->...kd', p_tile_f, do_tile_f)
+            
+            # dP = dO * V^T
+            dp_tile = torch.einsum('...qd,...kd->...qk', do_tile_f, v_tile_f)
+            
+            # dS = P * (dP - D)
+            ds_tile = p_tile_f * (dp_tile - D_tile.unsqueeze(-1)) * scale
+            
+            # dQ = dS * K
+            dq_tile = torch.einsum('...qk,...kd->...qd', ds_tile, k_tile_f)
+            
+            # dK = dS^T * Q
+            dk_tile = torch.einsum('...qk,...qd->...kd', ds_tile, q_tile_f)
+            
+            # Accumulate (handle mixed precision by casting before adding)
+            dK_chunk += dk_tile
+            dV_chunk += dv_tile
+            dQ[:, j*Bq:(j+1)*Bq, :] += dq_tile.to(dQ.dtype)
 
+        # Store K/V gradients
+        dK[:, i*Bk:(i+1)*Bk, :] += dK_chunk.to(dK.dtype)
+        dV[:, i*Bk:(i+1)*Bk, :] += dV_chunk.to(dV.dtype)
+        
+    return dQ, dK, dV
 
 
 class FlashAttnFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
-        Bq,Bk=16,16
+        Bq, Bk = 16, 16
         N, L, D = Q.shape
         assert L % Bq == 0 and L % Bk == 0
         Tq = L // Bq
         Tk = L // Bk
 
         out = torch.empty_like(Q)
-        L_out = torch.empty(( N, L), device=Q.device, dtype=torch.float32)
+        L_out = torch.empty((N, L), device=Q.device, dtype=torch.float32)
 
         for i in range(0, Tq):
-            q_tile=Q[:,i*Bq:(i+1)*Bq,:]
-            out_tile = torch.zeros((N,Bq,D), device=Q.device, dtype=Q.dtype)
-            m_prev = torch.full((N,Bq),float('-inf'), device=Q.device, dtype=torch.float32)
-            l_tile = torch.zeros((N,Bq), device=Q.device, dtype=torch.float32)
+            q_tile = Q[:, i*Bq:(i+1)*Bq, :]
+            out_tile = torch.zeros((N, Bq, D), device=Q.device, dtype=Q.dtype)
+            m_prev = torch.full((N, Bq), float('-inf'), device=Q.device, dtype=torch.float32)
+            l_tile = torch.zeros((N, Bq), device=Q.device, dtype=torch.float32)
             for j in range(0, Tk):
-                k_tile=K[:,j*Bk:(j+1)*Bk,:]
-                v_tile=V[:,j*Bk:(j+1)*Bk,:]
+                k_tile = K[:, j*Bk:(j+1)*Bk, :]
+                v_tile = V[:, j*Bk:(j+1)*Bk, :]
 
-                s_tile=torch.einsum('...bd,...kd->...bk',q_tile,k_tile)/(D**0.5)
+                s_tile = torch.einsum('...bd,...kd->...bk', q_tile, k_tile) / (D**0.5)
 
                 if is_causal:
-                    q_pos = torch.arange(i * Bq, (i + 1) * Bq, device=Q.device)  # (Bq,)
-                    k_pos = torch.arange(j * Bk, (j + 1) * Bk, device=Q.device)  # (Bk,)
-                    mask = (k_pos[None, :] <= q_pos[:, None])  # (Bq,Bk)
+                    q_pos = torch.arange(i * Bq, (i + 1) * Bq, device=Q.device)
+                    k_pos = torch.arange(j * Bk, (j + 1) * Bk, device=Q.device)
+                    mask = (k_pos[None, :] <= q_pos[:, None])
                     s_tile = s_tile.masked_fill(~mask[None, None, :, :], float('-inf'))
 
-                m_ij=torch.max(s_tile,dim=-1).values
-                m_new=torch.maximum(m_prev,m_ij)
+                m_ij = torch.max(s_tile, dim=-1).values
+                m_new = torch.maximum(m_prev, m_ij)
 
-                p_tile=torch.exp(s_tile - m_new.unsqueeze(-1))
-                l_tile_new=torch.exp(m_prev-m_new)*l_tile+p_tile.sum(dim=-1)
-                out_tile=torch.einsum('...bk,...kd->...bd',p_tile,v_tile)+torch.exp(m_prev-m_new).unsqueeze(-1)*out_tile
+                p_tile = torch.exp(s_tile - m_new.unsqueeze(-1))
+                l_tile_new = torch.exp(m_prev - m_new) * l_tile + p_tile.sum(dim=-1)
+                
+                # Careful with shapes and broadcasting here in reference impl
+                out_tile = torch.einsum('...bk,...kd->...bd', p_tile, v_tile) + \
+                           torch.exp(m_prev - m_new).unsqueeze(-1) * out_tile
 
-                l_tile=l_tile_new
-                m_prev=m_new
+                l_tile = l_tile_new
+                m_prev = m_new
 
-            out_tile=out_tile/l_tile.unsqueeze(-1)
-            out[:,i*Bq:(i+1)*Bq,:]=out_tile
-            lse_tile = m_prev + torch.log(l_tile)  # <-- this is the usual "LSE"
-            L_out[:, i * Bq:(i + 1) * Bq] = lse_tile  # <-- store this instead
-        ctx.save_for_backward(Q, K, V, L_out,out)
+            out_tile = out_tile / l_tile.unsqueeze(-1)
+            out[:, i*Bq:(i+1)*Bq, :] = out_tile
+            lse_tile = m_prev + torch.log(l_tile)
+            L_out[:, i*Bq:(i+1)*Bq] = lse_tile
+
+        ctx.save_for_backward(Q, K, V, L_out, out)
         ctx.is_causal = is_causal
         return out
+
+    @staticmethod
     def backward(ctx, dO):
-        Q, K, V, L_out,O = ctx.saved_tensors
+        Q, K, V, L_out, O = ctx.saved_tensors
         is_causal = ctx.is_causal
         dQ, dK, dV = flash_backward(Q, K, V, O, dO, L_out, is_causal, 1.0 / (Q.shape[-1] ** 0.5))
         return dQ, dK, dV, None
@@ -131,109 +170,110 @@ def flash_fwd_kernel(
     K_TILE_SIZE: tl.constexpr,
 ):
     query_block_idx = tl.program_id(0)
-    batch_idx=tl.program_id(1)
+    batch_idx = tl.program_id(1)
 
-    Q_block_ptr=tl.make_block_ptr(
-        Q_ptr+batch_idx*stride_qb,
-        shape=(N_QUERIES,D),
-        strides=(stride_qq,stride_qd),
-        offsets=(query_block_idx*Q_TILE_SIZE,0),
-        block_shape=(Q_TILE_SIZE,D),
-        order=(1,0),
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_idx * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_block_idx * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
     )
 
-    K_block_ptr=tl.make_block_ptr(
-        K_ptr+batch_idx*stride_kb,
-        shape=(N_KEYS,D),
-        strides=(stride_kk,stride_kd),
-        offsets=(0,0),
-        block_shape=(K_TILE_SIZE,D),
-        order=(1,0),
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_idx * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
     )
 
-    V_block_ptr=tl.make_block_ptr(
-        V_ptr+batch_idx*stride_vb,
-        shape=(N_KEYS,D),
-        strides=(stride_vk,stride_vd),
-        offsets=(0,0),
-        block_shape=(K_TILE_SIZE,D),
-        order=(1,0),
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_idx * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
     )
 
-    Out_block_ptr=tl.make_block_ptr(
-        Out_ptr+batch_idx*stride_ob,
-        shape=(N_QUERIES,D),
-        strides=(stride_oq,stride_od),
-        offsets=(query_block_idx*Q_TILE_SIZE,0),
-        block_shape=(Q_TILE_SIZE,D),
-        order=(1,0),
+    Out_block_ptr = tl.make_block_ptr(
+        Out_ptr + batch_idx * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_block_idx * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
     )
-    L_block_ptr=tl.make_block_ptr(
-        L_ptr+batch_idx*stride_lb,
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_idx * stride_lb,
         shape=(N_QUERIES,),
         strides=(stride_lq,),
-        offsets=(query_block_idx*Q_TILE_SIZE,),
+        offsets=(query_block_idx * Q_TILE_SIZE,),
         block_shape=(Q_TILE_SIZE,),
         order=(0,),
     )
 
-    q_tile=tl.load(Q_block_ptr)
-    out_tile=tl.zeros((Q_TILE_SIZE,D),dtype=tl.float32)
-    m_prev=tl.full((Q_TILE_SIZE,),-float('inf'),dtype=tl.float32)
-    l_tile=tl.zeros((Q_TILE_SIZE,),dtype=tl.float32)
-    for k_start in range(0,N_KEYS,K_TILE_SIZE):
-        k_tile=tl.load(K_block_ptr)
-        v_tile=tl.load(V_block_ptr)
+    q_tile = tl.load(Q_block_ptr)
+    
+    # 累加器必须是 fp32
+    out_tile = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    m_prev = tl.full((Q_TILE_SIZE,), -float('inf'), dtype=tl.float32)
+    l_tile = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    
+    for k_start in range(0, N_KEYS, K_TILE_SIZE):
+        k_tile = tl.load(K_block_ptr)
+        v_tile = tl.load(V_block_ptr)
+        
         s_tile = tl.dot(q_tile, tl.trans(k_tile)) * scale
 
         if is_causal:
             offs_n = k_start + tl.arange(0, K_TILE_SIZE)
             offs_m = query_block_idx * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
-            # 利用广播机制生成掩码矩阵 (Q_TILE_SIZE, K_TILE_SIZE)
-            # 只有 i >= j 的位置是合法的
             mask = offs_m[:, None] >= offs_n[None, :]
-            
-            # 将不合法的位置设为负无穷
             s_tile = tl.where(mask, s_tile, -float('inf'))
 
-        m_ij=tl.max(s_tile,axis=1)
-        m_new=tl.maximum(m_prev,m_ij)
+        m_ij = tl.max(s_tile, axis=1)
+        m_new = tl.maximum(m_prev, m_ij)
 
-        p_tile=tl.exp(s_tile - m_new[:,None])
-        l_tile_new=tl.exp(m_prev-m_new)*l_tile+tl.sum(p_tile,axis=1)
-        alpha = tl.exp(m_prev - m_new)                      # fp32
-        out_tile = alpha[:, None] * out_tile                # fp32
+        p_tile = tl.exp(s_tile - m_new[:, None])
+        l_tile_new = tl.exp(m_prev - m_new) * l_tile + tl.sum(p_tile, axis=1)
+        
+        alpha = tl.exp(m_prev - m_new)
+        out_tile = alpha[:, None] * out_tile
+        
         p_tile_cast = p_tile.to(v_tile.dtype)
-        out_tile = tl.dot(p_tile_cast, v_tile, acc=out_tile)     # acc= 保持 fp32 累积
+        out_tile = tl.dot(p_tile_cast, v_tile, acc=out_tile)
 
-
-        l_tile=l_tile_new
-        m_prev=m_new
+        l_tile = l_tile_new
+        m_prev = m_new
         K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
         V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
-    out_tile=out_tile/l_tile[:,None]
-    tl.store(Out_block_ptr,out_tile)
+    
+    out_tile = out_tile / l_tile[:, None]
+    
+    # 转换回输入数据的类型 (bf16/fp16) 再存储
+    out_tile_cast = out_tile.to(q_tile.dtype)
+    tl.store(Out_block_ptr, out_tile_cast)
+    
+    # LSE is always float32
     lse_tile = m_prev + tl.log(l_tile)
     tl.store(L_block_ptr, lse_tile)
-
-
-            
-
-
-
     
 
 class FlashAttentionTT(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
-        Bq,Bk=16,16
+        Bq, Bk = 16, 16 # Kernel block sizes must match
         N, L, D = Q.shape
         assert L % Bq == 0 and L % Bk == 0
         Tq = L // Bq
         Tk = L // Bk
 
         out = torch.empty_like(Q)
-        L_out = torch.empty(( N, L), device=Q.device, dtype=torch.float32)
+        L_out = torch.empty((N, L), device=Q.device, dtype=torch.float32)
 
         scale = 1.0 / (D ** 0.5)
 
@@ -255,14 +295,13 @@ class FlashAttentionTT(torch.autograd.Function):
             Bk,
         )
 
-        ctx.save_for_backward(Q, K, V, L_out,out)
+        ctx.save_for_backward(Q, K, V, L_out, out)
         ctx.is_causal = is_causal
         return out
 
     @staticmethod
     def backward(ctx, dO):
-        Q, K, V, L_out,O = ctx.saved_tensors
+        Q, K, V, L_out, O = ctx.saved_tensors
         is_causal = ctx.is_causal
         dQ, dK, dV = flash_backward(Q, K, V, O, dO, L_out, is_causal, 1.0 / (Q.shape[-1] ** 0.5))
         return dQ, dK, dV, None
-
