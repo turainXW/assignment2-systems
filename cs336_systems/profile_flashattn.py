@@ -40,8 +40,9 @@ def main():
     assert torch.cuda.is_available(), "Requires NVIDIA GPU"
     devname = torch.cuda.get_device_name(0)
 
+
     lens = [2**p for p in range(7, 17)]
-    dims = [2**p for p in range(4, 8)]
+    dims = [2**p for p in range(4, 7)]
     dtypes = [torch.bfloat16, torch.float32]
 
     results = []
@@ -64,6 +65,7 @@ def main():
             dt_str = "bf16" if dtype == torch.bfloat16 else "fp32"
             fa_oom = False
             pt_oom = False
+
 
             for L in lens:
                 B = 1
@@ -113,6 +115,8 @@ def main():
                       f"{fmt(res['fa_b'])} | {fmt(res['pt_b'])} | "
                       f"{fmt(res['fa_e'])} | {fmt(res['pt_e'])} |")
 
+          
+
         df = pd.DataFrame(results)
         df_final = df.copy()
         num_cols = ["fa_f", "pt_f", "fa_b", "pt_b", "fa_e", "pt_e"]
@@ -127,6 +131,66 @@ def main():
         with open(pkl_path, "wb") as f:
             pickle.dump(results, f)
         print(f"\nPartial results saved to: {pkl_path}")
+
+
+        # ---- 失败也画图/输出表格 ----
+        if len(results) > 0:
+            df = pd.DataFrame(results)
+
+            # 输出当前已记录的表格
+            df_show = df.copy()
+            num_cols = ["fa_f", "pt_f", "fa_b", "pt_b", "fa_e", "pt_e"]
+            for col in num_cols:
+                df_show[col] = df_show[col].apply(lambda x: f"{x:.5f}" if not pd.isna(x) else "OOM")
+            print("\nPARTIAL TABLE SUMMARY:")
+            print(df_show.to_markdown(index=False, tablefmt="github", stralign="right", numalign="right"))
+
+            # 画图：FA vs PT（Fwd/Bwd/E2E）按 L 分别对比
+            try:
+                import matplotlib.pyplot as plt
+                import numpy as np
+
+                outdir = "flash_attn_profile"
+                os.makedirs(outdir, exist_ok=True)
+
+                for dtype in df["Type"].unique():
+                    for D in sorted(df["D"].unique()):
+                        sub = df[(df["Type"] == dtype) & (df["D"] == D)].copy()
+                        if sub.empty:
+                            continue
+                        sub = sub.sort_values("L")
+
+                        # 过滤 NaN（OOM）
+                        def safe(vals):
+                            return np.array([v if not math.isnan(v) else np.nan for v in vals], dtype=float)
+
+                        Ls = sub["L"].values
+                        fa_f = safe(sub["fa_f"])
+                        pt_f = safe(sub["pt_f"])
+                        fa_b = safe(sub["fa_b"])
+                        pt_b = safe(sub["pt_b"])
+                        fa_e = safe(sub["fa_e"])
+                        pt_e = safe(sub["pt_e"])
+
+                        plt.figure(figsize=(10, 6))
+                        plt.plot(Ls, fa_f, label="FA Fwd")
+                        plt.plot(Ls, pt_f, label="PT Fwd")
+                        plt.plot(Ls, fa_b, label="FA Bwd")
+                        plt.plot(Ls, pt_b, label="PT Bwd")
+                        plt.plot(Ls, fa_e, label="FA E2E")
+                        plt.plot(Ls, pt_e, label="PT E2E")
+                        plt.xlabel("Sequence Length (L)")
+                        plt.ylabel("Latency (ms)")
+                        plt.title(f"FlashAttention vs PyTorch | dtype={dtype}, D={D}")
+                        plt.legend()
+                        plt.grid(True, linestyle="--", alpha=0.4)
+
+                        fig_path = os.path.join(outdir, f"plot_dtype-{dtype}_D-{D}.png")
+                        plt.savefig(fig_path, dpi=150, bbox_inches="tight")
+                        plt.close()
+                        print(f"Saved plot: {fig_path}")
+            except Exception as e:
+                print(f"Plotting skipped due to error: {e}")
 
 if __name__ == "__main__":
     main()

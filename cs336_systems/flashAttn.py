@@ -474,9 +474,9 @@ class FlashAttentionTT(torch.autograd.Function):
             1.0 / (Q.shape[-1] ** 0.5),
             is_causal,
             Q.shape[-1],
-            32,
-            32,
+            16,
+            16,
         )
-        grid = (K.shape[1] // 32, Q.shape[0])
+        grid = (K.shape[1] // 16, Q.shape[0])
         flash_bwd_kernel[grid](*flash_bwd_kernel_args)
         return dQ_fp32.to(Q.dtype), dK_fp32.to(K.dtype), dV_fp32.to(V.dtype), None
