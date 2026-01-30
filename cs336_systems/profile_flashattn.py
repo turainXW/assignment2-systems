@@ -26,7 +26,7 @@ def regular_pytorch_attention(Q, K, V, is_causal=True):
     if is_causal:
         L = Q.shape[-2]
         # 显式生成 Mask (这是 OOM 的主要原因)
-        mask = torch.ones((L, L), device=Q.device, dtype=torch.bool).triu(1)
+        mask = torch.triu(torch.ones(L, L, device=Q.device), diagonal=1).bool()
         S = S.masked_fill(mask, float("-inf"))
     P = torch.softmax(S, dim=-1)
     return torch.matmul(P, V)
@@ -66,6 +66,8 @@ def main():
             fa_oom = False
             pt_oom = False
 
+            torch.cuda.memory._record_memory_history(max_entries=100000)
+
 
             for L in lens:
                 B = 1
@@ -74,33 +76,48 @@ def main():
                 V = torch.randn((B, L, D), device="cuda", dtype=dtype, requires_grad=True)
                 dO = torch.randn((B, L, D), device="cuda", dtype=dtype)
 
-                def run_bench(func, is_already_oom):
+                def run_bench(func, is_already_oom, Q, K, V, dO):
                     if is_already_oom:
                         return {"f": float('nan'), "b": float('nan'), "e": float('nan')}, True
+                    
                     try:
+                        # 1. Benchmark Forward (无梯度模式，最省显存)
                         def fwd_fn():
-                            with torch.no_grad(): func(Q, K, V, True)
+                            with torch.no_grad():
+                                return func(Q, K, V, True)
                         f_lat = bench_fn(fwd_fn)
 
-                        q, k, v = Q.detach().requires_grad_(), K.detach().requires_grad_(), V.detach().requires_grad_()
-                        out = func(q, k, v, True)
+                        # 2. Benchmark Backward
+                        # 核心改进：必须在函数内部执行 Forward，才能产生新的计算图供 Backward 消耗
                         def bwd_fn():
-                            out.backward(dO, retain_graph=True)
-                        b_lat = bench_fn(bwd_fn)
+                            # 这里的前向传播是为了给后向传播提供计算图
+                            # 我们只需要测量 backward 那一行的耗时吗？
+                            # 实际上，业界标准通常是测量 E2E，或者如下构造：
+                            q, k, v = Q.detach().requires_grad_(), K.detach().requires_grad_(), V.detach().requires_grad_()
+                            tmp_out = func(q, k, v, True)
+                            tmp_out.backward(dO) # 这里不需要 retain_graph，因为每次循环都会重新生成图
+                        
+                        # 注意：这样测得的是 Fwd+Bwd 的总和，我们需要减去 Fwd
+                        fb_lat = bench_fn(bwd_fn)
+                        b_lat = max(0, fb_lat - f_lat)
 
-                        def e2e_fn():
-                            q1, k1, v1 = Q.detach().requires_grad_(), K.detach().requires_grad_(), V.detach().requires_grad_()
-                            o = func(q1, k1, v1, True)
-                            o.backward(dO)
-                        e_lat = bench_fn(e2e_fn)
+                        # 3. Benchmark E2E (其实就是 fb_lat)
+                        e_lat = fb_lat
 
+                        # 测量完毕后清理显存
+                        torch.cuda.empty_cache()
+                        
                         return {"f": f_lat, "b": b_lat, "e": e_lat}, False
+
                     except torch.cuda.OutOfMemoryError:
                         torch.cuda.empty_cache()
                         return {"f": float('nan'), "b": float('nan'), "e": float('nan')}, True
+                
+                
+                fa_res, fa_oom = run_bench(FlashAttentionTT.apply, fa_oom, Q, K, V, dO)
+                pt_res, pt_oom = run_bench(regular_pytorch_attention, pt_oom, Q, K, V, dO)
 
-                fa_res, fa_oom = run_bench(FlashAttentionTT.apply, fa_oom)
-                pt_res, pt_oom = run_bench(regular_pytorch_attention, pt_oom)
+
 
                 res = {
                     "Type": dt_str, "L": L, "D": D,
@@ -114,6 +131,16 @@ def main():
                       f"{fmt(res['fa_f'])} | {fmt(res['pt_f'])} | "
                       f"{fmt(res['fa_b'])} | {fmt(res['pt_b'])} | "
                       f"{fmt(res['fa_e'])} | {fmt(res['pt_e'])} |")
+            
+
+            try:
+                snapshot_path = str(D)+"d_"+dt_str+"snapshot.pickle"
+                torch.cuda.memory._dump_snapshot(outdir+"/"+snapshot_path)
+                print(f"Memory snapshot saved to: {snapshot_path}")
+            except Exception as e:
+                print(f"Failed to dump memory snapshot: {e}")
+            torch.cuda.memory._record_memory_history(None)
+
 
           
 
@@ -128,9 +155,6 @@ def main():
         print(df_final.to_markdown(index=False, tablefmt="github", stralign="right", numalign="right"))
 
     finally:
-        with open(pkl_path, "wb") as f:
-            pickle.dump(results, f)
-        print(f"\nPartial results saved to: {pkl_path}")
 
 
         # ---- 失败也画图/输出表格 ----
