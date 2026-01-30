@@ -532,3 +532,116 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
 def silu(x: torch.Tensor):
     return x * torch.sigmoid(x)
+
+
+# ...existing code...
+
+from flashAttn import FlashAttentionTT
+
+class MultiHeadSelfAttentionByTriton(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, positional_encoder: RotaryEmbedding):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.d_v = self.d_k
+
+        self.q_proj = Linear(self.d_model, self.num_heads * self.d_k)
+        self.k_proj = Linear(self.d_model, self.num_heads * self.d_k)
+        self.v_proj = Linear(self.d_model, self.num_heads * self.d_v)
+        self.output_proj = Linear(self.num_heads * self.d_v, self.d_model)
+        self.positional_encoder = positional_encoder  # RoPE
+
+    def forward(self, x: Float[Tensor, " ... seq d_k"], token_positions: Int[Tensor, " ... seq"] | None = None) -> Float[Tensor, " ... seq d_v"]:
+        *b, sequence_length, d_model = x.size()
+        assert d_model == self.d_model
+
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+
+        Q, K, V = (
+            rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
+            for X in (Q, K, V)
+        )
+
+        if token_positions is None:
+            token_positions = einx.rearrange("seq -> b... seq", torch.arange(sequence_length, device=x.device), b=[1] * len(b))
+        token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
+
+        Q = self.positional_encoder(Q, token_positions).contiguous()
+        K = self.positional_encoder(K, token_positions).contiguous()
+        V = V.contiguous() # V 也要连续
+
+        # Triton FlashAttentionTT.apply 返回的就是 output
+        attn_output = FlashAttentionTT.apply(Q, K, V, True)
+
+        attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
+        output = self.output_proj(attn_output)
+        return output
+
+class TransformerBlockByTriton(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, positional_encoder: RotaryEmbedding):
+        super().__init__()
+        self.attn = MultiHeadSelfAttentionByTriton(
+            d_model=d_model,
+            num_heads=num_heads,
+            positional_encoder=positional_encoder,
+        )
+        self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
+        self.ln1 = RMSNorm(d_model)
+        self.ln2 = RMSNorm(d_model)
+
+    def forward(self, x: torch.Tensor):
+        norm_x = self.ln1(x)
+        x_attn = self.attn(norm_x)
+        attn_sublayer_output = x + x_attn
+        norm_attn_output = self.ln2(attn_sublayer_output)
+        x_ffn = self.ffn(norm_attn_output)
+        ffn_sublayer_output = attn_sublayer_output + x_ffn
+        return ffn_sublayer_output
+
+class BasicsTransformerLMByTriton(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.token_embeddings = Embedding(vocab_size, d_model)
+        d_head = d_model // num_heads
+        self.positional_encoder = RotaryEmbedding(
+            context_length=context_length,
+            dim=d_head,
+            theta=rope_theta
+        )
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlockByTriton(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    positional_encoder=self.positional_encoder,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.ln_final = RMSNorm(d_model)
+        self.lm_head = Linear(d_model, vocab_size)
+
+    def forward(self, x: Int[Tensor, " ... sequence_length"]) -> Float[Tensor, " ... sequence_length vocab_size"]:
+        _, sequence_length = x.size()
+        x = self.token_embeddings(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.ln_final(x)
+        return self.lm_head(x)
