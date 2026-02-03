@@ -574,9 +574,18 @@ class MultiHeadSelfAttentionByTriton(nn.Module):
         K = self.positional_encoder(K, token_positions).contiguous()
         V = V.contiguous() # V 也要连续
 
-        # Triton FlashAttentionTT.apply 返回的就是 output
-        attn_output = FlashAttentionTT.apply(Q, K, V, True)
+                # 合并前两维: (Batch * Heads, Seq, DimHead) -> 3D
+        Q_flat = rearrange(Q, "b h s d -> (b h) s d")
+        K_flat = rearrange(K, "b h s d -> (b h) s d")
+        V_flat = rearrange(V, "b h s d -> (b h) s d")
 
+
+
+        # Triton FlashAttentionTT.apply 返回的就是 output
+        attn_output = FlashAttentionTT.apply(Q_flat, K_flat, V_flat, True)
+        batch_size = Q.shape[0]
+
+        attn_output = rearrange(attn_output, "(b h) s d -> b h s d", b=batch_size, h=self.num_heads)
         attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
         output = self.output_proj(attn_output)
         return output
